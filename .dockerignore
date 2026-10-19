@@ -1,0 +1,7 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__
+*.py[cod]
+*.zip

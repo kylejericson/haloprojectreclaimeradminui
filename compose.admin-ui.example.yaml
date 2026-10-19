@@ -1,0 +1,16 @@
+# Add this service under the existing czechhalo stack's `services:` section.
+# It shares the server folder and host network so it can use loopback RCON.
+  admin-ui:
+    build: ./admin-ui
+    restart: unless-stopped
+    network_mode: host
+    user: "65534:65534"
+    env_file:
+      - ./admin-ui.env
+    environment:
+      SERVER_DIR: /server
+      BIND_HOST: 0.0.0.0
+      PORT: 8780
+      COOKIE_SECURE: "false"
+    volumes:
+      - ./server:/server
