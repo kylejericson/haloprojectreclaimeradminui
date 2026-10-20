@@ -8,8 +8,9 @@ The panel is an independent community project and is not affiliated with or endo
 
 - Server names, player limits, and multiplayer playlist assignment.
 - Halo 3 campaign server settings: mission, starting insertion/rally point, difficulty, custom characters, and supported enemy health/damage modifiers. Campaign limits are checked against the 16-player maximum.
-- Playlist editing, upload, and a separate-tab creator with map/game rotation, ballot names and weights, time limit, rounds, score to win, CTF flag type, King of the Hill rotation, and advanced per-game rules/options/world values.
-- Steam Workshop item ID editing and local mod-folder upload into `content/Mods`.
+- Playlist editing, upload, and a separate-tab creator with map/game rotation, installed Workshop map choices, ballot names and weights, time limit, rounds, score to win, random or selected starting weapons, CTF flag type, King of the Hill rotation, and advanced per-game rules/options/world values.
+- Optional per-server playlist schedules that rotate between selected playlists after a configurable interval. Changes take effect at the next vote and do not interrupt the current game; the Admin UI process must remain running for its scheduler.
+- Steam Workshop downloads from item URLs using SteamCMD, item ID editing, and local mod-folder upload into `content/Mods`.
 - Live RCON status, player list, and ban/unban controls.
 
 The web app requires read/write access to the Reclaimer server folder and network access to each server's RCON endpoint. For RCON port/password/address, it reads the `dedicated.toml` configuration. Keep RCON private: it is unencrypted.
@@ -29,7 +30,7 @@ This method runs the panel with host networking so `127.0.0.1` RCON endpoints in
 
 5. Open `http://<server-lan-ip>:8780` and sign in. The compose example binds the panel to the host's network interfaces. Restrict access with your LAN firewall or VPN; do not forward port 8780 to the public internet.
 
-For an existing Dockge/Docker Compose stack, use `compose.admin-ui.example.yaml` as a service snippet, adjust the server folder mount, and keep the app's `user` aligned with the folder owner. Use host networking on Linux when RCON listens on loopback.
+For an existing Dockge/Docker Compose stack, use `compose.admin-ui.example.yaml` as a service snippet. In addition to the admin UI, mount the two named SteamCMD volumes into every Reclaimer server service and make each server depend on `admin-ui`; the example file explains the exact additions. Keep the app's `user` aligned with the server-folder owner. Use host networking on Linux when RCON listens on loopback.
 
 ### Port and network notes
 
@@ -65,6 +66,9 @@ Use `BIND_HOST=0.0.0.0` only when LAN/VPN clients need to connect, and protect i
 | `BIND_HOST` | `127.0.0.1` | Interface to bind. Use `0.0.0.0` for LAN access with firewall restrictions. |
 | `PORT` | `8780` | Web UI port. |
 | `COOKIE_SECURE` | `false` | Add the Secure cookie flag when served through HTTPS. |
+| `STEAMCMD_DIR` | `/opt/steamcmd` | SteamCMD install and Workshop download cache directory. |
+| `STEAMCMD_PATH` | `/opt/steamcmd/steamcmd.sh` | SteamCMD executable used by the panel. |
+| `STEAMCMD_HOME` | `/home/steamcmd` | Persistent SteamCMD home directory. |
 
 See `.env.example` for a Compose-ready template.
 
@@ -80,9 +84,21 @@ address = "127.0.0.1"
 
 Use one `[rcon]` section; edit it if it already exists. Do not forward RCON ports through a router. Reclaimer 0.9.18 or newer can apply valid server config edits through RCON reload; older versions may need a restart. Playlist edits take effect after validation and at the next vote.
 
-## Workshop and playlist uploads
+## Steam Workshop downloads and playlist uploads
 
-The panel can save Workshop IDs, but IDs alone do not download items in a Docker image without a configured SteamCMD provisioner. Use the folder-upload control for a downloaded Workshop folder containing a top-level `ModInfo.json`. Add the installed map to a playlist and restart the server to load a newly installed mod.
+The Docker image includes Valve's Linux SteamCMD client. Its install/cache and home directories are kept in named volumes so a container rebuild retains SteamCMD's files and signed-in session. Mount those same volumes into every Reclaimer server container; after a Workshop download, the panel writes `steamcmd = "/opt/steamcmd/reclaimer-steamcmd.sh"`, the Steam account name and item ID under `[workshop]` in `dedicated.toml`. The wrapper points SteamCMD at the persistent home directory without changing the server's Wine `HOME`.
+
+Before downloading an item, sign SteamCMD in once from the host/container terminal with an account that owns Halo: The Master Chief Collection. For example, from the Docker host:
+
+```sh
+docker exec -it <admin-ui-container> /opt/steamcmd/steamcmd.sh +login <steam-account-name> +quit
+```
+
+Replace the placeholders, enter the Steam password and Steam Guard approval/code only in that terminal, and let SteamCMD finish. The web UI accepts an item URL or ID and the account name; it does not receive or store the password or Guard code. The endpoint only downloads Workshop items for MCC (Steam app ID `976730`), checks for a valid top-level `ModInfo.json`, installs the item under `content/Mods/Workshop/<id>`, and adds the ID to the server configuration. Collections are not supported; download each item separately. SteamCMD may ask you to sign in again when its saved session expires. Steam website QR sign-in does not produce a SteamCMD session, so sign-in remains in SteamCMD's terminal flow.
+
+After installation, run `dedicated mods` in a Reclaimer server container to see the available map reference, add that reference to a playlist, then restart the server to load a newly installed mod. The UI also keeps its folder-upload control for manually downloaded mods.
+
+Valve's SteamCMD client and Project Reclaimer have separate Workshop responsibilities: the panel downloads the files, while Reclaimer reads the installed mod and provides its in-game sharing/update behavior. See the [Project Reclaimer Workshop guide](https://projectreclaimer.dev/host#mods) for server-side rules and account requirements.
 
 Playlist uploads must be `.playlist.json` files. Existing files are backed up as `.bak` before replacement. The playlist creator saves new files into the shared `playlists/` folder and can assign them to a selected multiplayer server.
 

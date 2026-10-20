@@ -14,3 +14,23 @@
       COOKIE_SECURE: "false"
     volumes:
       - ./server:/server
+      - steamcmd-data:/opt/steamcmd
+      - steamcmd-home:/home/steamcmd
+
+# Add these two volume lines to every Reclaimer server service too:
+#
+#     volumes:
+#       - steamcmd-data:/opt/steamcmd
+#       - steamcmd-home:/home/steamcmd
+#
+# Also add this to each server service so admin-ui seeds the SteamCMD volume
+# from its image on the first start:
+#
+#     depends_on:
+#       admin-ui:
+#         condition: service_started
+#
+# Keep these top-level volume declarations in the full Compose file.
+volumes:
+  steamcmd-data:
+  steamcmd-home:

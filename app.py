@@ -10,6 +10,7 @@ import secrets
 import shutil
 import socket
 import struct
+import subprocess
 import threading
 import time
 import tomllib
@@ -34,6 +35,15 @@ MOD_UPLOADS: dict[str, dict] = {}
 MOD_UPLOADS_LOCK = threading.Lock()
 MAX_MOD_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
 MAX_MOD_UPLOAD_FILE_BYTES = 4 * 1024 * 1024 * 1024
+STEAMCMD_DIR = Path(os.environ.get("STEAMCMD_DIR", "/opt/steamcmd")).resolve()
+STEAMCMD_PATH = Path(os.environ.get("STEAMCMD_PATH", str(STEAMCMD_DIR / "steamcmd.sh"))).resolve()
+STEAMCMD_HOME = Path(os.environ.get("STEAMCMD_HOME", "/home/steamcmd")).resolve()
+STEAM_WORKSHOP_APP_ID = "976730"  # Halo: The Master Chief Collection
+WORKSHOP_DOWNLOADS: dict[str, dict] = {}
+WORKSHOP_DOWNLOADS_LOCK = threading.Lock()
+WORKSHOP_DOWNLOAD_LOCK = threading.Lock()
+SCHEDULES_PATH = SERVER_DIR / "admin-ui-playlist-schedules.json"
+SCHEDULES_LOCK = threading.RLock()
 
 
 class PanelError(Exception):
@@ -264,17 +274,246 @@ def collect_state():
             item["players"] = []
         result.append(item)
     return {"servers": result, "playlists": playlist_names, "workshop_items": workshop_items,
-            "steamcmd_enabled": bool(doc.get("workshop", {}).get("steamcmd")),
+            "workshop_maps": installed_workshop_maps(),
+            "playlist_schedules": read_schedules(),
+            "steamcmd_enabled": STEAMCMD_PATH.is_file(),
             "updated_at": int(time.time())}
+
+
+def installed_workshop_maps():
+    """Return playlist map references for Workshop packages installed in Mods."""
+    root = SERVER_DIR / "content" / "Mods"
+    found = {}
+    if not root.is_dir():
+        return []
+    for info in root.rglob("ModInfo.json"):
+        item_dir = info.parent
+        item_id = item_dir.name if item_dir.name.isdigit() else ""
+        if not item_id:
+            item_id = next((parent.name for parent in item_dir.parents if parent.name.isdigit()), "")
+        try:
+            json.loads(info.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        maps_dir = item_dir / "maps"
+        if not maps_dir.is_dir():
+            continue
+        for map_file in maps_dir.rglob("*.map"):
+            if map_file.stem.lower() in {"shared", "campaign"}:
+                continue
+            name = map_file.stem
+            reference = f"workshop:{item_id}/{name}" if item_id else name
+            found[reference] = {"map": reference,
+                                "label": f"{name} · Workshop {item_id}" if item_id else f"{name} · Installed mod"}
+    return sorted(found.values(), key=lambda item: item["label"].casefold())
+
+
+def read_schedules():
+    try:
+        content = json.loads(SCHEDULES_PATH.read_text(encoding="utf-8"))
+        if isinstance(content, dict):
+            return content
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def write_schedules(schedules):
+    temp = SCHEDULES_PATH.with_name(f".{SCHEDULES_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(schedules, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, SCHEDULES_PATH)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def set_scheduled_playlist(port, playlist):
+    doc, servers = config_servers()
+    target = next((server for server in doc.get("server", []) if int(server.get("port", 0)) == port), None)
+    panel_server = next((server for server in servers if server["port"] == port), None)
+    if target is None or panel_server is None or panel_server["mode"] == "campaign":
+        raise PanelError("The scheduled server is no longer configured for multiplayer")
+    safe_playlist_path(playlist)
+    target["playlist"] = f"playlists/{playlist}"
+    for key in ("map", "game", "variant", "base_map"):
+        target.pop(key, None)
+    write_doc(doc)
+    reply = SourceRcon(panel_server["rcon_address"], panel_server["rcon_port"],
+                       panel_server["rcon_password"]).command("reload")
+    if "configuration not reloaded" in reply.lower():
+        raise PanelError(reply)
+    return reply
+
+
+def playlist_schedule_loop():
+    while True:
+        time.sleep(10)
+        now = time.time()
+        with SCHEDULES_LOCK:
+            schedules = read_schedules()
+            changed = False
+            for port_text, schedule in list(schedules.items()):
+                if not schedule.get("enabled") or float(schedule.get("next_switch_at", 0)) > now:
+                    continue
+                playlists = schedule.get("playlists", [])
+                if len(playlists) < 2:
+                    continue
+                next_index = (int(schedule.get("current_index", 0)) + 1) % len(playlists)
+                try:
+                    set_scheduled_playlist(int(port_text), playlists[next_index])
+                    schedule["current_index"] = next_index
+                    schedule["last_switch_at"] = int(now)
+                    schedule["next_switch_at"] = int(now + int(schedule["interval_minutes"]) * 60)
+                    schedule["last_error"] = ""
+                except Exception as exc:
+                    schedule["last_error"] = str(exc)[:1000]
+                    schedule["next_switch_at"] = int(now + 60)
+                changed = True
+            if changed:
+                write_schedules(schedules)
+
+
+def write_backup(path: Path):
+    backup = path.with_suffix(path.suffix + ".bak")
+    temp = backup.with_name(f".{backup.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(path, temp)
+        os.replace(temp, backup)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def write_doc(doc):
     path = SERVER_DIR / "dedicated.toml"
     temp = path.with_suffix(".toml.tmp")
     if path.exists():
-        shutil.copy2(path, path.with_suffix(".toml.bak"))
+        write_backup(path)
     temp.write_text(tomlkit.dumps(doc), encoding="utf-8")
     os.replace(temp, path)
+
+
+def workshop_item_id(value: str) -> str:
+    value = value.strip()
+    if value.isdigit():
+        item = value
+    else:
+        parsed = urlparse(value)
+        if (parsed.scheme not in {"http", "https"}
+                or parsed.hostname not in {"steamcommunity.com", "www.steamcommunity.com"}
+                or parsed.path.rstrip("/") != "/sharedfiles/filedetails"):
+            raise PanelError("Enter a Steam Workshop item URL or numeric item ID (collections are not supported)")
+        item = parse_qs(parsed.query).get("id", [""])[0]
+    if not item.isdigit() or len(item) < 5 or len(item) > 20:
+        raise PanelError("The Workshop URL does not contain a valid item ID")
+    return item
+
+
+def workshop_content_path(item_id: str) -> Path:
+    relative = Path("steamapps") / "workshop" / "content" / STEAM_WORKSHOP_APP_ID / item_id
+    candidates = (
+        STEAMCMD_DIR / relative,
+        STEAMCMD_HOME / relative,
+        STEAMCMD_HOME / ".steam" / "steam" / relative,
+        STEAMCMD_HOME / ".steam" / "steamcmd" / relative,
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise PanelError("SteamCMD finished, but its downloaded Workshop folder was not found")
+
+
+def perform_workshop_download(job_id: str, item_id: str, username: str, session_token: str):
+    def update(**values):
+        with WORKSHOP_DOWNLOADS_LOCK:
+            job = WORKSHOP_DOWNLOADS.get(job_id)
+            if job:
+                job.update(values)
+
+    if not WORKSHOP_DOWNLOAD_LOCK.acquire(blocking=False):
+        update(status="failed", message="Another Workshop download is already running. Wait for it to finish.")
+        return
+    try:
+        update(status="downloading", message=f"SteamCMD is downloading Workshop item {item_id}…")
+        env = os.environ.copy()
+        env["HOME"] = str(STEAMCMD_HOME)
+        command = [str(STEAMCMD_PATH), "+login", username, "+workshop_download_item",
+                   STEAM_WORKSHOP_APP_ID, item_id, "+quit"]
+        try:
+            result = subprocess.run(command, cwd=STEAMCMD_DIR, env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=3600, check=False)
+        except subprocess.TimeoutExpired:
+            update(status="failed", message="SteamCMD timed out after 60 minutes. Check its sign-in and logs, then retry.")
+            return
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode != 0 or "Success. Downloaded item" not in output:
+            tail = "\n".join(output.splitlines()[-12:]).strip()
+            update(status="failed", message=(tail or f"SteamCMD exited with code {result.returncode}")[-1800:])
+            return
+
+        source = workshop_content_path(item_id)
+        info_path = source / "ModInfo.json"
+        if not info_path.is_file():
+            update(status="failed", message="The downloaded item has no top-level ModInfo.json; it does not look like a Reclaimer mod.")
+            return
+        try:
+            json.loads(info_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            update(status="failed", message="The downloaded item’s ModInfo.json is not valid JSON.")
+            return
+
+        total_size = 0
+        for root, dirs, files in os.walk(source, followlinks=False):
+            if any((Path(root) / name).is_symlink() for name in dirs + files):
+                update(status="failed", message="The Workshop folder contains symbolic links and was not installed.")
+                return
+            for name in files:
+                total_size += (Path(root) / name).stat().st_size
+                if total_size > MAX_MOD_UPLOAD_BYTES:
+                    update(status="failed", message="This Workshop item exceeds the 8 GiB installation limit.")
+                    return
+
+        mods = SERVER_DIR / "content" / "Mods" / "Workshop"
+        mods.mkdir(parents=True, exist_ok=True)
+        destination = mods / item_id
+        staging = mods / f".{item_id}.installing-{uuid.uuid4().hex}"
+        backup = mods / f".{item_id}.previous-{uuid.uuid4().hex}"
+        moved_old = False
+        try:
+            shutil.copytree(source, staging)
+            if destination.exists():
+                os.replace(destination, backup)
+                moved_old = True
+            os.replace(staging, destination)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            if moved_old and backup.exists() and not destination.exists():
+                os.replace(backup, destination)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+        doc = read_toml()
+        if "workshop" not in doc:
+            doc["workshop"] = tomlkit.table()
+        items = doc["workshop"].get("items", [])
+        changed = False
+        if int(item_id) not in [int(value) for value in items]:
+            items.append(int(item_id))
+            doc["workshop"]["items"] = items
+            changed = True
+        if str(doc["workshop"].get("steamcmd", "")) != "/opt/steamcmd/reclaimer-steamcmd.sh":
+            doc["workshop"]["steamcmd"] = "/opt/steamcmd/reclaimer-steamcmd.sh"
+            changed = True
+        if str(doc["workshop"].get("username", "")) != username:
+            doc["workshop"]["username"] = username
+            changed = True
+        if changed:
+            write_doc(doc)
+        update(status="complete", message=f"Downloaded item {item_id} into content/Mods/Workshop/{item_id} and saved its ID in dedicated.toml. Use `dedicated mods` to find its map name for a playlist.")
+    except Exception as exc:
+        update(status="failed", message=str(exc))
+    finally:
+        WORKSHOP_DOWNLOAD_LOCK.release()
 
 
 def require_port(port: int):
@@ -401,13 +640,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
             return
         if parsed.path.startswith("/api/"):
-            if not self.authenticated():
+            session = self.authenticated()
+            if not session:
                 return
             try:
                 if parsed.path == "/api/session":
                     self.send_json({"csrf": self.session()[0]})
                 elif parsed.path == "/api/state":
                     self.send_json(collect_state())
+                elif parsed.path == "/api/workshop-download/status":
+                    job_id = parse_qs(parsed.query).get("job", [""])[0]
+                    with WORKSHOP_DOWNLOADS_LOCK:
+                        job = WORKSHOP_DOWNLOADS.get(job_id)
+                        if not job or not secrets.compare_digest(job["session"], session[0]):
+                            raise PanelError("Workshop download job was not found; start it again")
+                        self.send_json({key: job[key] for key in ("status", "message", "item_id")})
                 elif parsed.path == "/api/playlist":
                     name = parse_qs(parsed.query).get("file", [""])[0]
                     data = json.loads(safe_playlist_path(name).read_text(encoding="utf-8"))
@@ -626,7 +873,7 @@ class Handler(BaseHTTPRequestHandler):
                 obj = validate_playlist(data.get("data"))
                 path = safe_playlist_path(name)
                 if path.exists():
-                    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+                    write_backup(path)
                 path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
                 self.send_json({"ok": True, "message": "Playlist saved. Running servers will use it from the next vote after validation."})
             elif parsed.path == "/api/playlist-upload":
@@ -637,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise PanelError("A playlist with that name already exists; confirm replacement to overwrite it")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists():
-                    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+                    write_backup(path)
                 temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
                 try:
                     temp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -661,7 +908,81 @@ class Handler(BaseHTTPRequestHandler):
                     doc["workshop"] = tomlkit.table()
                 doc["workshop"]["items"] = [int(i) for i in clean]
                 write_doc(doc)
-                self.send_json({"ok": True, "message": "Workshop IDs saved to dedicated.toml. In this Docker setup, IDs alone do not download mods; upload the mod folder below."})
+                self.send_json({"ok": True, "message": "Saved Workshop IDs. Use Download from Workshop to install an item from its URL."})
+            elif parsed.path == "/api/schedule":
+                port = int(data.get("port", 0))
+                enabled = bool(data.get("enabled", True))
+                _, configured = config_servers()
+                server = next((item for item in configured if item["port"] == port), None)
+                if server is None or server["mode"] == "campaign":
+                    raise PanelError("Choose a configured multiplayer server")
+                with SCHEDULES_LOCK:
+                    schedules = read_schedules()
+                    if not enabled:
+                        schedules.pop(str(port), None)
+                        write_schedules(schedules)
+                        self.send_json({"ok": True, "message": "Playlist schedule disabled. The server keeps its current playlist."})
+                        return
+                    playlists = data.get("playlists")
+                    if not isinstance(playlists, list):
+                        raise PanelError("Select at least two playlists")
+                    clean = []
+                    for value in playlists:
+                        filename = str(value).strip()
+                        safe_playlist_path(filename)
+                        if filename not in clean:
+                            clean.append(filename)
+                    if len(clean) < 2 or len(clean) > 20:
+                        raise PanelError("Select between 2 and 20 playlists for rotation")
+                    interval = int(data.get("interval_minutes", 40))
+                    if not 5 <= interval <= 10080:
+                        raise PanelError("Switch interval must be 5 minutes to 7 days")
+                    current = server["playlist"]
+                    current_index = clean.index(current) if current in clean else 0
+                    message = "Playlist schedule saved. Each change takes effect at the next vote; a game already in progress is not interrupted."
+                    if current not in clean:
+                        try:
+                            reply = set_scheduled_playlist(port, clean[0])
+                            if reply:
+                                message += f" Reclaimer: {reply}"
+                        except Exception as exc:
+                            message += f" The first playlist was saved to dedicated.toml, but live reload could not be confirmed: {exc}"
+                    schedules[str(port)] = {
+                        "enabled": True,
+                        "interval_minutes": interval,
+                        "playlists": clean,
+                        "current_index": current_index,
+                        "next_switch_at": int(time.time() + interval * 60),
+                        "last_switch_at": int(time.time()),
+                        "last_error": "",
+                    }
+                    write_schedules(schedules)
+                self.send_json({"ok": True, "message": message})
+            elif parsed.path == "/api/workshop-download/start":
+                item_id = workshop_item_id(str(data.get("url", "")))
+                username = str(data.get("username", "")).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", username):
+                    raise PanelError("Enter the Steam account name you signed in to SteamCMD with (no password)")
+                if not STEAMCMD_PATH.is_file() or not os.access(STEAMCMD_PATH, os.X_OK):
+                    raise PanelError("SteamCMD is missing. Rebuild the admin UI with the updated project files.")
+                if shutil.disk_usage(SERVER_DIR).free < 1_073_741_824:
+                    raise PanelError("Free at least 1 GiB on the server volume before downloading a Workshop item")
+                if WORKSHOP_DOWNLOAD_LOCK.locked():
+                    raise PanelError("Another Workshop download is already running. Wait for it to finish.")
+                job_id = uuid.uuid4().hex
+                session_token = self.session()[0]
+                with WORKSHOP_DOWNLOADS_LOCK:
+                    WORKSHOP_DOWNLOADS[job_id] = {"session": session_token, "status": "queued",
+                                                  "message": "Waiting for SteamCMD…", "item_id": item_id}
+                    if len(WORKSHOP_DOWNLOADS) > 64:
+                        for old_id, old in list(WORKSHOP_DOWNLOADS.items()):
+                            if old.get("status") in {"complete", "failed"}:
+                                WORKSHOP_DOWNLOADS.pop(old_id, None)
+                                if len(WORKSHOP_DOWNLOADS) <= 48:
+                                    break
+                threading.Thread(target=perform_workshop_download,
+                                 args=(job_id, item_id, username, session_token), daemon=True).start()
+                self.send_json({"ok": True, "job": job_id, "item_id": item_id}, 202)
             elif parsed.path == "/api/ban":
                 port = int(data.get("port", 0))
                 server = require_port(port)
@@ -697,6 +1018,7 @@ def main():
         raise SystemExit("Set ADMIN_PASSWORD before starting Reclaimer Control")
     server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     print(f"Project Reclaimer Admin UI listening on {BIND_HOST}:{PORT}; server folder {SERVER_DIR}")
+    threading.Thread(target=playlist_schedule_loop, name="playlist-scheduler", daemon=True).start()
     server.serve_forever()
 
 

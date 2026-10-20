@@ -13,3 +13,9 @@ services:
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
     volumes:
       - "${SERVER_DIR_HOST:?Set SERVER_DIR_HOST in .env}:/server"
+      - steamcmd-data:/opt/steamcmd
+      - steamcmd-home:/home/steamcmd
+
+volumes:
+  steamcmd-data:
+  steamcmd-home:
