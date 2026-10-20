@@ -345,6 +345,30 @@ def set_scheduled_playlist(port, playlist):
     return reply
 
 
+def send_server_message(port, message):
+    server = require_port(port)
+    message = str(message).strip()
+    if not message:
+        raise PanelError("Enter a message to send")
+    if len(message) > 300:
+        raise PanelError("Messages must be 300 characters or fewer")
+    if any(ord(char) < 32 or ord(char) == 127 for char in message):
+        raise PanelError("Messages must be a single line without control characters")
+    return SourceRcon(server["rcon_address"], server["rcon_port"],
+                      server["rcon_password"]).command("say " + message)
+
+
+def playlist_display_name(filename):
+    try:
+        data = json.loads(safe_playlist_path(filename).read_text(encoding="utf-8"))
+        name = str(data.get("name", "")).strip()
+        if name:
+            return name[:120]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, PanelError):
+        pass
+    return Path(filename).stem[:120]
+
+
 def playlist_schedule_loop():
     while True:
         time.sleep(10)
@@ -353,10 +377,29 @@ def playlist_schedule_loop():
             schedules = read_schedules()
             changed = False
             for port_text, schedule in list(schedules.items()):
-                if not schedule.get("enabled") or float(schedule.get("next_switch_at", 0)) > now:
+                if not schedule.get("enabled"):
                     continue
                 playlists = schedule.get("playlists", [])
                 if len(playlists) < 2:
+                    continue
+                next_switch_at = int(schedule.get("next_switch_at", 0))
+                announce_minutes = int(schedule.get("announce_minutes", 5))
+                if (announce_minutes > 0 and now < next_switch_at
+                        and now >= next_switch_at - announce_minutes * 60
+                        and int(schedule.get("announcement_sent_for", 0)) != next_switch_at):
+                    next_index = (int(schedule.get("current_index", 0)) + 1) % len(playlists)
+                    next_name = playlist_display_name(playlists[next_index])
+                    minute_word = "minute" if announce_minutes == 1 else "minutes"
+                    announcement = (f"The playlist will change to {next_name} in "
+                                   f"{announce_minutes} {minute_word}. It takes effect at the next vote.")
+                    try:
+                        send_server_message(int(port_text), announcement)
+                        schedule["announcement_sent_for"] = next_switch_at
+                        schedule["announcement_error"] = ""
+                    except Exception as exc:
+                        schedule["announcement_error"] = str(exc)[:500]
+                    changed = True
+                if next_switch_at > now:
                     continue
                 next_index = (int(schedule.get("current_index", 0)) + 1) % len(playlists)
                 try:
@@ -365,6 +408,8 @@ def playlist_schedule_loop():
                     schedule["last_switch_at"] = int(now)
                     schedule["next_switch_at"] = int(now + int(schedule["interval_minutes"]) * 60)
                     schedule["last_error"] = ""
+                    schedule["announcement_sent_for"] = 0
+                    schedule["announcement_error"] = ""
                 except Exception as exc:
                     schedule["last_error"] = str(exc)[:1000]
                     schedule["next_switch_at"] = int(now + 60)
@@ -937,6 +982,9 @@ class Handler(BaseHTTPRequestHandler):
                     interval = int(data.get("interval_minutes", 40))
                     if not 5 <= interval <= 10080:
                         raise PanelError("Switch interval must be 5 minutes to 7 days")
+                    announce_minutes = int(data.get("announce_minutes", 5))
+                    if not 0 <= announce_minutes <= 60:
+                        raise PanelError("Announcement lead time must be 0 to 60 minutes")
                     current = server["playlist"]
                     current_index = clean.index(current) if current in clean else 0
                     message = "Playlist schedule saved. Each change takes effect at the next vote; a game already in progress is not interrupted."
@@ -950,14 +998,21 @@ class Handler(BaseHTTPRequestHandler):
                     schedules[str(port)] = {
                         "enabled": True,
                         "interval_minutes": interval,
+                        "announce_minutes": announce_minutes,
                         "playlists": clean,
                         "current_index": current_index,
                         "next_switch_at": int(time.time() + interval * 60),
                         "last_switch_at": int(time.time()),
                         "last_error": "",
+                        "announcement_sent_for": 0,
+                        "announcement_error": "",
                     }
                     write_schedules(schedules)
                 self.send_json({"ok": True, "message": message})
+            elif parsed.path == "/api/say":
+                port = int(data.get("port", 0))
+                reply = send_server_message(port, str(data.get("message", "")))
+                self.send_json({"ok": True, "reply": reply or "Message sent to server chat."})
             elif parsed.path == "/api/workshop-download/start":
                 item_id = workshop_item_id(str(data.get("url", "")))
                 username = str(data.get("username", "")).strip()

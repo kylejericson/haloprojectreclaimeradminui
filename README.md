@@ -10,6 +10,7 @@ The panel is an independent community project and is not affiliated with or endo
 - Halo 3 campaign server settings: mission, starting insertion/rally point, difficulty, custom characters, and supported enemy health/damage modifiers. Campaign limits are checked against the 16-player maximum.
 - Playlist editing, upload, and a separate-tab creator with map/game rotation, installed Workshop map choices, ballot names and weights, time limit, rounds, score to win, random or selected starting weapons, CTF flag type, King of the Hill rotation, and advanced per-game rules/options/world values.
 - Optional per-server playlist schedules that rotate between selected playlists after a configurable interval. Changes take effect at the next vote and do not interrupt the current game; the Admin UI process must remain running for its scheduler.
+- Automatic server chat announcements before a scheduled playlist change, with a configurable lead time, plus manual one-time messages to a selected server.
 - Steam Workshop downloads from item URLs using SteamCMD, item ID editing, and local mod-folder upload into `content/Mods`.
 - Live RCON status, player list, and ban/unban controls.
 
