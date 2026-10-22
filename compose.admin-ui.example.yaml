@@ -17,6 +17,22 @@
       - steamcmd-data:/opt/steamcmd
       - steamcmd-home:/home/steamcmd
 
+  # Reclaimer's own CLI validates every candidate playlist before the UI saves it.
+  # This helper has no published ports and does not need the Docker socket.
+  playlist-validator:
+    image: ghcr.io/projectreclaimer/project-reclaimer-dedicated:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/reclaimer-playlist-validator.sh"]
+    environment:
+      PUID: "65534"
+      PGID: "65534"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./server:/server
+      - ./server/game:/server/game:ro
+      - ./admin-ui/reclaimer-playlist-validator.sh:/opt/reclaimer-playlist-validator.sh:ro
+
 # Add these two volume lines to every Reclaimer server service too:
 #
 #     volumes:

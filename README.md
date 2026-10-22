@@ -9,6 +9,7 @@ The panel is an independent community project and is not affiliated with or endo
 - Server names, player limits, and multiplayer playlist assignment.
 - Halo 3 campaign server settings: mission, starting insertion/rally point, difficulty, custom characters, and supported enemy health/damage modifiers. Campaign limits are checked against the 16-player maximum.
 - Playlist editing, upload, and a separate-tab creator with map/game rotation, installed Workshop map choices, ballot names and weights, time limit, rounds, score to win, random or selected starting weapons, CTF flag type, King of the Hill rotation, and advanced per-game rules/options/world values.
+- Playlist validation through Reclaimer's own `dedicated playlist show` command before create, upload, or edit saves; unused playlists can be deleted from the main panel, with a backup retained.
 - Optional per-server playlist schedules that rotate between selected playlists after a configurable interval. Changes take effect at the next vote and do not interrupt the current game; the Admin UI process must remain running for its scheduler.
 - Automatic server chat announcements before a scheduled playlist change, with a configurable lead time, plus manual one-time messages to a selected server.
 - Steam Workshop downloads from item URLs using SteamCMD, item ID editing, and local mod-folder upload into `content/Mods`.
@@ -31,7 +32,7 @@ This method runs the panel with host networking so `127.0.0.1` RCON endpoints in
 
 5. Open `http://<server-lan-ip>:8780` and sign in. The compose example binds the panel to the host's network interfaces. Restrict access with your LAN firewall or VPN; do not forward port 8780 to the public internet.
 
-For an existing Dockge/Docker Compose stack, use `compose.admin-ui.example.yaml` as a service snippet. In addition to the admin UI, mount the two named SteamCMD volumes into every Reclaimer server service and make each server depend on `admin-ui`; the example file explains the exact additions. Keep the app's `user` aligned with the server-folder owner. Use host networking on Linux when RCON listens on loopback.
+For an existing Dockge/Docker Compose stack, use `compose.admin-ui.example.yaml` as a service snippet. It includes the Admin UI and a small, portless playlist-validator service based on the official Reclaimer image. The validator shares the server folder, runs Reclaimer's own playlist check, and does not mount the Docker socket. Add both services from the example. In addition to the Admin UI, mount the two named SteamCMD volumes into every Reclaimer server service and make each server depend on `admin-ui`; the example file explains the exact additions. Keep the app's `user` aligned with the server-folder owner. Use host networking on Linux when RCON listens on loopback.
 
 ### Port and network notes
 
@@ -101,7 +102,11 @@ After installation, run `dedicated mods` in a Reclaimer server container to see 
 
 Valve's SteamCMD client and Project Reclaimer have separate Workshop responsibilities: the panel downloads the files, while Reclaimer reads the installed mod and provides its in-game sharing/update behavior. See the [Project Reclaimer Workshop guide](https://projectreclaimer.dev/host#mods) for server-side rules and account requirements.
 
-Playlist uploads must be `.playlist.json` files. Existing files are backed up as `.bak` before replacement. The playlist creator saves new files into the shared `playlists/` folder and can assign them to a selected multiplayer server.
+Playlist uploads must be `.playlist.json` files. Existing files are backed up as `.bak` before replacement. The playlist creator saves new files into the shared `playlists/` folder and can assign them to a selected multiplayer server. Create, upload, and edit operations stage the candidate file and ask the `playlist-validator` service to run `dedicated playlist show`; a failed validation leaves the saved playlist unchanged. The main panel prevents deleting a playlist assigned to a server or referenced by a saved schedule.
+
+## Playlist Creator content menus
+
+The `playlist-validator` sidecar writes `dedicated content` output to `.admin-playlist-validation/catalog.txt` on startup, whenever `content/Maps`, `content/Game Modes` or `content/Mods` changes, or when `catalog-refresh` exists in that folder. The creator groups map variants under their base map and game variants under their base mode. When a map variant is chosen, game variants with a matching name (for example `MISC D Day` → `D-day Infection`) are listed first, and an `INF`/`RACE`/`SLYR`/`OBJ` name prefix marks the matching mode group as suggested. Suggestions are hints only; Reclaimer's validator still decides on save. Files Reclaimer skips as damaged are not listed; parse errors land in `catalog-error.txt`.
 
 ## Development and contributions
 

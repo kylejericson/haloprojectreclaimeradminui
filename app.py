@@ -44,6 +44,13 @@ WORKSHOP_DOWNLOADS_LOCK = threading.Lock()
 WORKSHOP_DOWNLOAD_LOCK = threading.Lock()
 SCHEDULES_PATH = SERVER_DIR / "admin-ui-playlist-schedules.json"
 SCHEDULES_LOCK = threading.RLock()
+PLAYLIST_VALIDATION_DIR = SERVER_DIR / ".admin-playlist-validation"
+PLAYLIST_VALIDATION_LOCK = threading.Lock()
+CONTENT_CATALOG_PATH = PLAYLIST_VALIDATION_DIR / "catalog.txt"
+CONTENT_CATALOG_CACHE: dict = {"mtime": None, "data": None}
+CONTENT_CATALOG_SECTIONS = {"Maps:": "maps", "Map variants:": "map_variants",
+                            "Game types:": "game_types", "Game variants:": "game_variants"}
+CONTENT_CATALOG_ENTRY = re.compile(r'^\s+"([^"]*)"(?:\s+(.*))?$')
 
 
 class PanelError(Exception):
@@ -112,6 +119,69 @@ def validate_playlist(data):
         if not isinstance(game, dict) or not isinstance(game.get("map"), str) or not isinstance(game.get("game"), str):
             raise PanelError("Each playlist entry needs string map and game values")
     return data
+
+
+def validate_with_reclaimer(name: str, data):
+    """Ask the companion Reclaimer container to validate a staged playlist."""
+    validate_playlist(data)
+    ready_file = PLAYLIST_VALIDATION_DIR / "worker-ready"
+    if not ready_file.is_file() or time.time() - ready_file.stat().st_mtime > 10:
+        raise PanelError("Reclaimer playlist validation is unavailable. Start the playlist-validator service from the Compose file.")
+    (SERVER_DIR / "playlists").mkdir(parents=True, exist_ok=True)
+    request_id = uuid.uuid4().hex
+    staged_name = f"admin-validation-{request_id}.playlist.json"
+    staged_path = safe_playlist_path(staged_name)
+    queue_dir = PLAYLIST_VALIDATION_DIR / "requests"
+    result_dir = PLAYLIST_VALIDATION_DIR / "results"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    request_path = queue_dir / f"{request_id}.txt"
+    result_path = result_dir / f"{request_id}.txt"
+    staged_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        with PLAYLIST_VALIDATION_LOCK:
+            request_path.write_text(staged_name + "\n", encoding="ascii")
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if result_path.is_file():
+                    lines = result_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    result_path.unlink(missing_ok=True)
+                    try:
+                        exit_code = int(lines[0])
+                    except (IndexError, ValueError):
+                        raise PanelError("Reclaimer validator returned an unreadable result")
+                    output = "\n".join(lines[1:]).strip()
+                    if exit_code != 0 or re.search(r"(?im)^Error:", output):
+                        raise PanelError(f"Reclaimer rejected {name}: {output or 'playlist validation failed'}")
+                    return output
+                time.sleep(0.25)
+            raise PanelError("Timed out waiting for the Reclaimer playlist validator. Check that the playlist-validator service is running.")
+    finally:
+        request_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+        staged_path.unlink(missing_ok=True)
+
+
+def delete_playlist(name: str):
+    name = uploaded_playlist_name(name)
+    path = safe_playlist_path(name)
+    if not path.is_file():
+        raise PanelError("That playlist was not found")
+    _, servers = config_servers()
+    assigned = [server["name"] for server in servers if server["playlist"] == name]
+    schedules = read_schedules()
+    scheduled = [port for port, schedule in schedules.items()
+                 if name in schedule.get("playlists", [])]
+    if assigned or scheduled:
+        used_by = []
+        if assigned:
+            used_by.append("servers: " + ", ".join(assigned))
+        if scheduled:
+            used_by.append("saved schedules on ports: " + ", ".join(scheduled))
+        raise PanelError("Remove this playlist from " + "; ".join(used_by) + " before deleting it")
+    write_backup(path)
+    path.unlink()
+    return "Playlist deleted. A .bak backup was kept."
 
 
 def uploaded_playlist_name(name: str) -> str:
@@ -254,7 +324,8 @@ def parse_players(text: str):
 def collect_state():
     _, servers = config_servers()
     playlists_dir = SERVER_DIR / "playlists"
-    playlist_names = sorted(p.name for p in playlists_dir.glob("*.json")) if playlists_dir.exists() else []
+    playlist_names = sorted(p.name for p in playlists_dir.glob("*.json")
+                            if not p.name.startswith("admin-validation-")) if playlists_dir.exists() else []
     doc = read_toml()
     workshop_items = list(doc.get("workshop", {}).get("items", []))
     result = []
@@ -275,6 +346,7 @@ def collect_state():
         result.append(item)
     return {"servers": result, "playlists": playlist_names, "workshop_items": workshop_items,
             "workshop_maps": installed_workshop_maps(),
+            "content_catalog": load_content_catalog(),
             "playlist_schedules": read_schedules(),
             "steamcmd_enabled": STEAMCMD_PATH.is_file(),
             "updated_at": int(time.time())}
@@ -306,6 +378,52 @@ def installed_workshop_maps():
             found[reference] = {"map": reference,
                                 "label": f"{name} · Workshop {item_id}" if item_id else f"{name} · Installed mod"}
     return sorted(found.values(), key=lambda item: item["label"].casefold())
+
+
+def parse_content_catalog(text: str):
+    """Parse `dedicated content` output into base names and variants with their base map/mode."""
+    catalog = {"maps": [], "map_variants": [], "game_types": [], "game_variants": []}
+    section, source = None, "builtin"
+    for line in text.splitlines():
+        header = next((key for prefix, key in CONTENT_CATALOG_SECTIONS.items() if line.startswith(prefix)), None)
+        if header:
+            section, source = header, "builtin"
+            continue
+        if line and not line[0].isspace():
+            section = None
+            continue
+        stripped = line.strip()
+        if stripped.startswith("From ") and stripped.endswith(":"):
+            source = "content" if stripped == "From your content folder:" else "builtin"
+            continue
+        match = CONTENT_CATALOG_ENTRY.match(line)
+        if section is None or not match or not match.group(1):
+            continue
+        value, rest = match.group(1), (match.group(2) or "").strip()
+        if section in ("maps", "game_types"):
+            # Workshop maps already come from installed_workshop_maps().
+            if not value.startswith("workshop:"):
+                catalog[section].append(value)
+            continue
+        label, _, base = rest.rpartition(" · ")
+        if not base:
+            continue
+        name = label[1:-1] if label.startswith('"') and label.endswith('"') else value
+        catalog[section].append({"value": value, "name": name, "base": base, "source": source})
+    for key in ("map_variants", "game_variants"):
+        catalog[key].sort(key=lambda item: (item["name"].casefold(), item["value"].casefold()))
+    return catalog
+
+
+def load_content_catalog():
+    """Return the cached Reclaimer content catalog written by the playlist-validator sidecar."""
+    if not CONTENT_CATALOG_PATH.is_file():
+        return None
+    mtime = CONTENT_CATALOG_PATH.stat().st_mtime
+    if CONTENT_CATALOG_CACHE["mtime"] != mtime:
+        parsed = parse_content_catalog(CONTENT_CATALOG_PATH.read_text(encoding="utf-8", errors="replace"))
+        CONTENT_CATALOG_CACHE.update(mtime=mtime, data={**parsed, "updated_at": int(mtime)} if parsed["game_types"] else None)
+    return CONTENT_CATALOG_CACHE["data"]
 
 
 def read_schedules():
@@ -828,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
                         server.pop(key, None)
                 else:
                     if not 1 <= max_players <= 127:
-                        raise PanelError("Player limit must be between 1 and 127")
+                        raise PanelError("Dedicated multiplayer servers support 1–127 players; the server uses the 128th slot")
                 if panel_server["mode"] != "campaign" and playlist:
                     safe_playlist_path(Path(playlist).name)
                     if Path(playlist).name != playlist:
@@ -914,19 +1032,21 @@ class Handler(BaseHTTPRequestHandler):
                     MOD_UPLOADS.pop(token, None)
                 self.send_json({"ok": True})
             elif parsed.path == "/api/playlist":
-                name = str(data.get("file", ""))
+                name = uploaded_playlist_name(str(data.get("file", "")))
                 obj = validate_playlist(data.get("data"))
                 path = safe_playlist_path(name)
+                validate_with_reclaimer(name, obj)
                 if path.exists():
                     write_backup(path)
                 path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                self.send_json({"ok": True, "message": "Playlist saved. Running servers will use it from the next vote after validation."})
+                self.send_json({"ok": True, "message": "Reclaimer validated the playlist. It was saved; running servers will use it from the next vote."})
             elif parsed.path == "/api/playlist-upload":
                 name = uploaded_playlist_name(str(data.get("file", "")))
                 obj = validate_playlist(data.get("data"))
                 path = safe_playlist_path(name)
                 if path.exists() and not bool(data.get("replace", False)):
                     raise PanelError("A playlist with that name already exists; confirm replacement to overwrite it")
+                validate_with_reclaimer(name, obj)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if path.exists():
                     write_backup(path)
@@ -936,7 +1056,10 @@ class Handler(BaseHTTPRequestHandler):
                     os.replace(temp, path)
                 finally:
                     temp.unlink(missing_ok=True)
-                self.send_json({"ok": True, "file": name, "message": f"Uploaded {name}. Assign it to a server in Server settings; running servers use playlist changes after validation."})
+                self.send_json({"ok": True, "file": name, "message": f"Reclaimer validated and saved {name}. Assign it to a server in Server settings."})
+            elif parsed.path == "/api/playlist-delete":
+                name = str(data.get("file", ""))
+                self.send_json({"ok": True, "message": delete_playlist(name), "file": name})
             elif parsed.path == "/api/workshop":
                 ids = data.get("items")
                 if not isinstance(ids, list) or len(ids) > 64:
